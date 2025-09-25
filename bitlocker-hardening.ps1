@@ -3,12 +3,12 @@ BitLocker hardening script
 Run in 64-bit PowerShell as Administrator.
 
 - Ensures a recovery protector is present and backed up.
-- Enables BitLocker (software by default for compatibility).
+- Enables BitLocker.
 - Adds TPM+PIN and can remove TPM-only protectors afterwards.
 #>
 
 param(
-    [string]$MountPoint = "C:",
+    [Alias('d')][string]$MountPoint = "C:",
     [int[]]$PCRsToEnable = @(0,2,4,7,11),
     [int]$MinPinLength = 8,
     [bool]$RequireADBackup = $false,
@@ -38,58 +38,35 @@ function Ensure-BackupFolder {
     }
 }
 
-# Save text to a file
+# Save text to a file (returns $true on success)
 function Save-TextToFile {
     param($text, $path)
     try {
         $text | Out-File -FilePath $path -Encoding UTF8 -Force
         return $true
     } catch {
-        Write-Warning "Failed to write to ${path}: $($_.Exception.Message)"
+        Write-Warning ("Failed to write to {0}: {1}" -f $path, $_.Exception.Message)
         return $false
     }
 }
 
-# Save key protectors to a readable file for auditing/backup
-function Backup-ProtectorsToFile {
-    param($MountPoint)
-    try {
-        Ensure-BackupFolder -folder $BackupFolder
-        $timestamp = (Get-Date).ToString("yyyyMMdd_HHmmss")
-        $outFile = Join-Path -Path $BackupFolder -ChildPath ("BitLocker_Protectors_$timestamp.txt")
-        $kp = (Get-BitLockerVolume -MountPoint $MountPoint -ErrorAction SilentlyContinue).KeyProtector
-        if ($kp) {
-            $kp | Format-List * | Out-File -FilePath $outFile -Encoding UTF8
-            Log "Protectors written to $outFile"
-        } else {
-            "No KeyProtectors found for $MountPoint" | Out-File -FilePath $outFile -Encoding UTF8
-            Log "No protectors found. Empty file created at $outFile"
-        }
-        return $outFile
-    } catch {
-        Write-Warning "Failed to backup protectors: $($_.Exception.Message)"
-        return $null
-    }
-}
-
-# Capture manage-bde protectors output (this often contains the recovery password text)
+# Save manage-bde protectors output to a timestamped file and return file path and text
 function Save-ManageBdeProtectorsText {
     param($MountPoint)
     try {
-        Ensure-BackupFolder -folder $BackupFolder
+        Ensure-BackupFolder -folder $BackupFolder | Out-Null
         $text = & manage-bde.exe -protectors -get $MountPoint 2>&1
         $stamp = (Get-Date).ToString("yyyyMMdd_HHmmss")
         $file = Join-Path -Path $BackupFolder -ChildPath ("ManageBDE_Protectors_$stamp.txt")
         Save-TextToFile -text $text -path $file | Out-Null
-        Log "manage-bde protector text saved to $file"
         return $file, $text
     } catch {
-        Write-Warning "Failed to capture manage-bde protectors text: $($_.Exception.Message)"
+        Log ("Failed to capture manage-bde protectors text: {0}" -f $_.Exception.Message)
         return $null, $null
     }
 }
 
-# Try to extract the 48-digit recovery password from manage-bde text
+# Extract a 48-digit recovery password (formatted with dashes) from text
 function Extract-RecoveryPasswordFromText {
     param($text)
     if (-not $text) { return $null }
@@ -97,30 +74,18 @@ function Extract-RecoveryPasswordFromText {
     if ($m.Success) { return $m.Groups[1].Value } else { return $null }
 }
 
-# Make manage-bde output slightly more readable for display
-function Pretty-PrintManageBdeOutput {
-    param($text)
-    if (-not $text) { return }
-    $pretty = $text -replace 'ACTIONS REQUIRED:', "`nACTIONS REQUIRED:`n"
-    $pretty = $pretty -replace 'To prevent data loss,', "`nTo prevent data loss,"
-    Write-Host $pretty
-}
-
-# Simple logger that writes to a file in the backup folder
+# Simple logger that writes timestamped messages to a logfile in the backup folder
 function Log {
     param([string]$m)
     try {
-        if (-not (Test-Path $BackupFolder)) { Ensure-BackupFolder -folder $BackupFolder }
+        if (-not (Test-Path $BackupFolder)) { Ensure-BackupFolder -folder $BackupFolder | Out-Null }
         if (-not $global:LogFile) { $global:LogFile = Join-Path $BackupFolder ("bitlocker_script_$(Get-Date -Format yyyyMMdd_HHmmss).log") }
         $t = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
         "$t - $m" | Out-File -FilePath $global:LogFile -Append -Encoding UTF8
-        Write-Host $m
-    } catch {
-        Write-Host $m
-    }
+    } catch { }
 }
 
-# Poll the volume until encryption/protection shows activity or timeout
+# Poll the BitLocker volume until encryption or active protection is detected, or timeout
 function Wait-ForEncryptionStart {
     param(
         [string]$MountPoint = "C:",
@@ -143,10 +108,33 @@ function Wait-ForEncryptionStart {
     return $false
 }
 
+# Heuristic check for hardware encryption support using manage-bde output
+function Test-HardwareEncryptionSupported {
+    param([string]$MountPoint = "C:")
+    try {
+        $out = & manage-bde.exe -status $MountPoint 2>&1
+        if (-not $out) { return $false }
+        $joined = $out -join "`n"
+        if ($joined -match 'Hardware encryption' -or $joined -match 'HardwareEncrypted' -or $joined -match 'Hardware encryption:\s*Yes') {
+            return $true
+        }
+        if ($joined -match 'Hardware encryption:\s*No' -or $joined -match 'Not hardware') {
+            return $false
+        }
+        if ($joined -match 'Hardware' -and $joined -match 'encryption') {
+            return $true
+        }
+        return $false
+    } catch {
+        Log ("Test-HardwareEncryptionSupported failed: {0}" -f $_.Exception.Message)
+        return $false
+    }
+}
+
 # ---------- Start ----------
 Write-Host "`nIMPORTANT: This script changes BitLocker protectors and policies and can affect access to your data." -ForegroundColor Red
 Write-Host "Make a copy of the recovery password and store it offline (USB, printed, or an offline password manager) before rebooting or removing protectors." -ForegroundColor Red
-Write-Host "Flow: 1) create/save recovery protector  2) enable BitLocker (software by default)  3) after encryption finishes re-run to add TPM+PIN." -ForegroundColor Yellow
+Write-Host "Flow: 1) create/save recovery protector  2) enable BitLocker  3) after encryption finishes re-run to add TPM+PIN." -ForegroundColor Yellow
 
 $consent = Read-Host "Do you understand and accept the risk? Type 'y' to continue"
 if ($consent -ne 'y') {
@@ -157,38 +145,36 @@ if ($consent -ne 'y') {
 # Basic environment checks
 Write-Host "`n== Sanity checks ==" -ForegroundColor Cyan
 Write-Host "PROCESSOR_ARCHITECTURE = $($env:PROCESSOR_ARCHITECTURE)"
-if ($env:PROCESSOR_ARCHITECTURE -ne "AMD64") {
-    Write-Warning "Please run 64-bit PowerShell as Administrator."
-}
+if ($env:PROCESSOR_ARCHITECTURE -ne "AMD64") { Write-Warning "Please run 64-bit PowerShell as Administrator." }
 if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
     Write-Warning "You are not running as Administrator. Re-run elevated."
 }
 
+# Check Secure Boot state (if available)
 try {
-    $sb = Confirm-SecureBootUEFI
-    Write-Host "Secure Boot enabled: $sb" -ForegroundColor Cyan
-} catch {
-    Write-Host "Secure Boot check not available on this platform or requires admin." -ForegroundColor Yellow
-}
+    $sb = & { Confirm-SecureBootUEFI } 2>$null
+    if ($null -ne $sb) { Write-Output "Secure Boot enabled: $($sb.ToString())" }
+} catch { }
 
 # Prepare backup folder and restrict access
-Ensure-BackupFolder -folder $BackupFolder
-
+Ensure-BackupFolder -folder $BackupFolder | Out-Null
 try {
     $acl = Get-Acl -Path $BackupFolder
     $acl.SetAccessRuleProtection($true, $false)
-    $acl.Access | ForEach-Object { $acl.RemoveAccessRule($_) }
+    $acl.Access | ForEach-Object { [void]$acl.RemoveAccessRule($_) }
     $rule1 = New-Object System.Security.AccessControl.FileSystemAccessRule("BUILTIN\Administrators","FullControl","ContainerInherit,ObjectInherit","None","Allow")
     $rule2 = New-Object System.Security.AccessControl.FileSystemAccessRule("NT AUTHORITY\SYSTEM","FullControl","ContainerInherit,ObjectInherit","None","Allow")
-    $acl.AddAccessRule($rule1)
-    $acl.AddAccessRule($rule2)
-    Set-Acl -Path $BackupFolder -AclObject $acl
-    Log "Backup folder ensured and ACL restricted: $BackupFolder"
+    [void]$acl.AddAccessRule($rule1)
+    [void]$acl.AddAccessRule($rule2)
+    Set-Acl -Path $BackupFolder -AclObject $acl | Out-Null
+    Log ("Backup folder ensured and ACL restricted: {0}" -f $BackupFolder)
+    Write-Output "Backup folder ensured and ACL restricted: $BackupFolder"
 } catch {
-    Write-Warning "Failed to set strict ACL on ${BackupFolder}: $($_.Exception.Message)"
-    Log "Warning: could not set ACL on $BackupFolder"
+    Write-Warning ("Failed to set strict ACL on {0}: {1}" -f $BackupFolder, $_.Exception.Message)
+    Log ("Warning: could not set ACL on {0}" -f $BackupFolder)
 }
 
+# Load saved encryption preference if present
 $choiceFile = Join-Path -Path $BackupFolder -ChildPath $ChoiceFileName
 $useSoftware = $null
 if (Test-Path $choiceFile) {
@@ -196,7 +182,7 @@ if (Test-Path $choiceFile) {
         $json = Get-Content -Path $choiceFile -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json
         if ($json -and $json.useSoftware -ne $null) {
             $useSoftware = [bool]$json.useSoftware
-            Write-Host "Using previously saved encryption preference: useSoftware = $useSoftware" -ForegroundColor Cyan
+            Write-Output "Using previously saved encryption preference."
         }
     } catch {
         Write-Warning "Failed to read saved choice file; will prompt for encryption preference." -ForegroundColor Yellow
@@ -212,31 +198,49 @@ try {
             Write-Warning "TPM detected but not ready/activated. Ensure TPM is enabled and activated in firmware."
             Log "TPM present but not ready."
         } else {
-            Write-Host "TPM present. Manufacturer: $($tpm.ManufacturerId)  SpecVersion: $($tpm.SpecVersion)" -ForegroundColor Cyan
+            Write-Output "TPM present."
             Log "TPM ready."
         }
     }
 } catch {
-    Write-Warning "Get-Tpm unavailable or no TPM present: $($_.Exception.Message)"
-    Log "No TPM or Get-Tpm failed."
+    Write-Warning ("Get-Tpm unavailable or no TPM present: {0}" -f $_.Exception.Message)
+    Log ("No TPM or Get-Tpm failed: {0}" -f $_.Exception.Message)
 }
 
-# Encryption preference prompt (software is the default now)
+# Prompt for encryption preference if no saved choice
 if ($useSoftware -eq $null) {
     Write-Host "`nBy default this script will prefer software encryption (recommended for compatibility)." -ForegroundColor Cyan
     Write-Host "Hardware encryption can offer benefits, but not all drives or firmware expose it reliably." -ForegroundColor Yellow
     $ans = Ask-YesNo "Do you want to prefer software encryption?" -Default 'y'
     $useSoftware = $ans
+
+    # If user chose hardware, validate capability
+    if (-not $useSoftware) {
+        $hwSupported = Test-HardwareEncryptionSupported -MountPoint $MountPoint
+        if (-not $hwSupported) {
+            Write-Host "`nThis drive does not appear to support hardware-based encryption (or the capability could not be detected)." -ForegroundColor Yellow
+            $hwChoice = Ask-YesNo "Switch to software encryption instead? (Choose 'n' to cancel the run)" -Default 'y'
+            if ($hwChoice) {
+                $useSoftware = $true
+                Write-Host "Switching to software encryption as requested." -ForegroundColor Cyan
+            } else {
+                Write-Host "User cancelled due to lack of hardware encryption support. Exiting." -ForegroundColor Cyan
+                return
+            }
+        } else {
+            Write-Host "Drive appears to support hardware encryption. Saving preference." -ForegroundColor Cyan
+        }
+    }
+
     try {
         @{ useSoftware = $useSoftware } | ConvertTo-Json | Set-Content -Path $choiceFile -Encoding UTF8 -Force
-        Write-Host "Saved encryption preference to $choiceFile" -ForegroundColor Cyan
+        Write-Host "Saved encryption preference to choice file." -ForegroundColor Cyan
     } catch {
-        Write-Warning "Failed to save choice file: $($_.Exception.Message)"
+        Write-Warning ("Failed to save choice file: {0}" -f $_.Exception.Message)
     }
 } else {
-    Write-Host "`nSkipping encryption preference prompt (already set)." -ForegroundColor Cyan
+    Write-Output "`nSkipping encryption preference prompt (already set)."
 }
-
 $forceSoftware = $useSoftware
 
 # Policy registry keys
@@ -253,7 +257,7 @@ function Ensure-RegDword {
         if ($prop -and $prop.PSObject.Properties.Name -contains $name) { $current = $prop."$name" }
     } catch { $current = $null }
     if ($current -ne $desired) {
-        Set-ItemProperty -Path $path -Name $name -Value $desired -Type DWord -Force
+        Set-ItemProperty -Path $path -Name $name -Value $desired -Type DWord -Force | Out-Null
         $script:policyChanged = $true
         Write-Host "Set $name = $desired" -ForegroundColor Green
     } else {
@@ -284,8 +288,8 @@ if ($policyChanged) {
     Write-Host "No policy changes needed. Skipping gpupdate." -ForegroundColor Cyan
 }
 
-# UEFI PCR profile
-Write-Host "`nEnsuring UEFI PCR profile..." -ForegroundColor Cyan
+# UEFI PCR profile settings
+Write-Host "`n== UEFI PCR profile ==" -ForegroundColor Cyan
 $pvKey = "HKLM:\SOFTWARE\Policies\Microsoft\FVE\OSPlatformValidation_UEFI"
 if (-not (Test-Path $pvKey)) { New-Item -Path $pvKey -Force | Out-Null }
 
@@ -296,7 +300,7 @@ try {
     if ($prop -and $prop.PSObject.Properties.Name -contains "Enabled") { $enabledCurr = $prop.Enabled }
 } catch { $enabledCurr = $null }
 
-if ($enabledCurr -ne 1) { Set-ItemProperty -Path $pvKey -Name "Enabled" -Value 1 -Type DWord -Force; $pvChanged = $true }
+if ($enabledCurr -ne 1) { Set-ItemProperty -Path $pvKey -Name "Enabled" -Value 1 -Type DWord -Force | Out-Null; $pvChanged = $true }
 
 for ($i = 0; $i -le 23; $i++) {
     $desired = [int]($PCRsToEnable -contains $i)
@@ -306,7 +310,7 @@ for ($i = 0; $i -le 23; $i++) {
         if ($prop -and $prop.PSObject.Properties.Name -contains ("$i")) { $curr = $prop."$i" }
     } catch { $curr = $null }
     if ($curr -ne $desired) {
-        Set-ItemProperty -Path $pvKey -Name ("{0}" -f $i) -Value $desired -Type DWord -Force
+        Set-ItemProperty -Path $pvKey -Name ("{0}" -f $i) -Value $desired -Type DWord -Force | Out-Null
         $pvChanged = $true
     }
 }
@@ -316,28 +320,18 @@ if ($pvChanged) {
 } else {
     Write-Host "UEFI PCR profile already matches desired values. Skipping rewrite." -ForegroundColor Cyan
 }
-Write-Host "Note: If managed by Group Policy or MDM, local changes may be overridden." -ForegroundColor Yellow
 
-# Show current status
-Write-Host "`nCurrent BitLocker status and protectors:" -ForegroundColor Cyan
+# Show current BitLocker status for the specified mount point
+Write-Host "`n== Current BitLocker status ==" -ForegroundColor Cyan
 $blv = Get-BitLockerVolume -MountPoint $MountPoint -ErrorAction SilentlyContinue
 if (-not $blv) {
     Write-Host "Could not query BitLocker volume for $MountPoint. Ensure BitLocker feature is available and run elevated." -ForegroundColor Red
     return
 }
-$blv | Format-List *
-Write-Host "`nEncryptionMethod property above shows whether the drive currently uses hardware or software encryption." -ForegroundColor Cyan
+$blv | Select-Object ComputerName,MountPoint,EncryptionMethod,VolumeStatus,ProtectionStatus,EncryptionPercentage,KeyProtector | Format-List *
 
-$encMethod = $blv.EncryptionMethod
-if ($encMethod -match "Hardware|HardwareEncryption") {
-    $currentIsHardware = $true
-    Write-Host "Drive appears to be using hardware encryption." -ForegroundColor Yellow
-} else {
-    $currentIsHardware = $false
-    Write-Host "Drive appears to be using software encryption or standard BitLocker cipher." -ForegroundColor Cyan
-}
-
-# Ensure recovery protector exists and back it up
+# Recovery protector handling
+Write-Host "`n== Recovery protector ==" -ForegroundColor Cyan
 $kp = $blv.KeyProtector
 $hasRecovery = $false
 $hasTPM = $false
@@ -347,61 +341,54 @@ if ($kp) {
 }
 
 if (-not $hasRecovery) {
-    Write-Host "`nNo recovery password protector found. Creating one now..." -ForegroundColor Yellow
     try {
-        $newRec = Add-BitLockerKeyProtector -MountPoint $MountPoint -RecoveryPasswordProtector -ErrorAction Stop
+        Add-BitLockerKeyProtector -MountPoint $MountPoint -RecoveryPasswordProtector -ErrorAction Stop | Out-Null
         $file, $text = Save-ManageBdeProtectorsText -MountPoint $MountPoint
         $pwd = Extract-RecoveryPasswordFromText -text $text
+
+        Ensure-BackupFolder -folder $BackupFolder | Out-Null
+        $recFile = Join-Path -Path $BackupFolder -ChildPath ("RecoveryPassword_{0:yyyyMMdd_HHmmss}.txt" -f (Get-Date))
         if ($pwd) {
-            Ensure-BackupFolder -folder $BackupFolder
-            $recFile = Join-Path -Path $BackupFolder -ChildPath ("RecoveryPassword_{0:yyyyMMdd_HHmmss}.txt" -f (Get-Date))
             $recText = "Recovery password for $MountPoint`r`n`r`n$pwd`r`n`r`nCOPY THIS PASSWORD TO AN EXTERNAL DEVICE BEFORE REBOOTING."
-            Save-TextToFile -text $recText -path $recFile | Out-Null
-            Write-Host "`nA new recovery password was created and saved to: $recFile" -ForegroundColor Green
-            Write-Host "`nIMPORTANT: COPY THE FOLLOWING RECOVERY PASSWORD TO AN EXTERNAL DEVICE (USB / printed / offline password manager):" -ForegroundColor Red
-            Write-Host "`n$pwd`n" -ForegroundColor Green
         } else {
-            if ($newRec -and $newRec.RecoveryPassword) {
-                $pwd2 = $newRec.RecoveryPassword
-                Ensure-BackupFolder -folder $BackupFolder
-                $recFile = Join-Path -Path $BackupFolder -ChildPath ("RecoveryPassword_{0:yyyyMMdd_HHmmss}.txt" -f (Get-Date))
-                $recText = "Recovery password for $MountPoint`r`n`r`n$pwd2`r`n`r`nCOPY THIS PASSWORD TO AN EXTERNAL DEVICE BEFORE REBOOTING."
-                Save-TextToFile -text $recText -path $recFile | Out-Null
-                Write-Host "`nRecovery password saved to: $recFile" -ForegroundColor Green
-                Write-Host "`n$pwd2`n" -ForegroundColor Green
-            } else {
-                Write-Host "Recovery password protector created but the script could not automatically extract the displayed password." -ForegroundColor Yellow
-                Write-Host "Run 'manage-bde -protectors -get $MountPoint' to view and save it manually." -ForegroundColor Yellow
-                if ($file) { Pretty-PrintManageBdeOutput -text $text }
-            }
+            $recText = "Recovery password for $MountPoint`r`n`r`n(see manage-bde output in backup folder)`r`n`r`nCOPY THIS PASSWORD TO AN EXTERNAL DEVICE BEFORE REBOOTING."
+        }
+        Save-TextToFile -text $recText -path $recFile | Out-Null
+
+        if ($file) {
+            Write-Host "`nRecovery password created and saved to $file" -ForegroundColor Green
+        } else {
+            Write-Host "`nRecovery password created and saved to backup folder." -ForegroundColor Green
         }
     } catch {
-        Write-Warning "Failed to create recovery protector: $($_.Exception.Message)"
+        Write-Warning ("Failed to create recovery protector: {0}" -f $_.Exception.Message)
+        Log ("Add-BitLockerKeyProtector (Recovery) failed: {0}" -f $_.Exception.Message)
     }
 } else {
     Write-Host "Recovery protector already present." -ForegroundColor Cyan
     $file, $text = Save-ManageBdeProtectorsText -MountPoint $MountPoint
     $pwd = Extract-RecoveryPasswordFromText -text $text
     if ($pwd) {
-        Write-Host "`nFound recovery password in saved manage-bde output. IMPORTANT: copy it to an external device before rebooting." -ForegroundColor Red
-        Write-Host "`n$pwd`n" -ForegroundColor Green
+        Write-Host "`nFound recovery password in saved manage-bde output. Ensure you have it backed up." -ForegroundColor Red
+    } else {
+        if ($file) { Log ("manage-bde protector text saved to: {0}" -f $file) }
     }
 }
 
-# Ensure TPM protector exists
+# TPM protector handling
+Write-Host "`n== TPM protector ==" -ForegroundColor Cyan
 if (-not $hasTPM) {
-    Write-Host "`nAdding TPM protector (if supported)..." -ForegroundColor Cyan
     try {
         Add-BitLockerKeyProtector -MountPoint $MountPoint -TpmProtector -ErrorAction Stop | Out-Null
         Write-Host "TPM protector added." -ForegroundColor Green
     } catch {
-        Write-Warning "Failed to add TPM protector (may already exist or TPM unavailable): $($_.Exception.Message)"
+        Write-Warning ("Failed to add TPM protector (may already exist or TPM unavailable): {0}" -f $_.Exception.Message)
     }
 } else {
     Write-Host "TPM protector already present." -ForegroundColor Cyan
 }
 
-# Refresh BitLocker object and detect existing TPM+PIN protector
+# Refresh and detect existing TPM+PIN protector
 $blv = Get-BitLockerVolume -MountPoint $MountPoint -ErrorAction SilentlyContinue
 $kp = $blv.KeyProtector
 $existingTpmPin = $null
@@ -413,77 +400,65 @@ if ($kp) {
 if ($existingTpmPin -and ($blv.ProtectionStatus -ne 1 -or $blv.EncryptionMethod -eq $null -or $blv.EncryptionMethod -eq "None")) {
     Write-Host "`nTPM+PIN protector is present but BitLocker protection is not active." -ForegroundColor Yellow
     $doEnable = Ask-YesNo "Do you want to proceed to enable BitLocker/encryption now?" -Default 'y'
-    if (-not $doEnable) {
-        Write-Host "User chose not to enable encryption now. Exiting." -ForegroundColor Cyan
-        return
-    } else {
-        Write-Host "Proceeding to enable BitLocker/encryption." -ForegroundColor Cyan
-    }
+    if (-not $doEnable) { Write-Host "User chose not to enable encryption now. Exiting." -ForegroundColor Cyan; return } else { Write-Host "Proceeding to enable BitLocker/encryption." -ForegroundColor Cyan }
 }
 
 # Enable BitLocker if not already enabled
+Write-Host "`n== Encryption enablement ==" -ForegroundColor Cyan
 if ($blv.ProtectionStatus -eq 0 -or $blv.EncryptionMethod -eq $null -or $blv.EncryptionMethod -eq "None") {
-    Write-Host "`nDetected unprotected OS volume. Enabling BitLocker now..." -ForegroundColor Cyan
+    Write-Host "Detected unprotected OS volume. Enabling BitLocker now..." -ForegroundColor Cyan
+
     $enabled = $false
     $requiresRebootForHardwareTest = $false
-    $fallbackOutput = $null
+    $manageBdeOutput = $null
+    $manageBdeFailed = $false
 
+    # Try manage-bde first
     try {
-        if ($forceSoftware) {
-            Enable-BitLocker -MountPoint $MountPoint -EncryptionMethod XtsAes256 -UsedSpaceOnly -ErrorAction Stop
-        } else {
-            Enable-BitLocker -MountPoint $MountPoint -UsedSpaceOnly -ErrorAction Stop
-        }
-        $enabled = $true
-    } catch {
-        $msg = $_.Exception.Message
-        if ($msg -match 'Parameter set cannot be resolved') {
-            Write-Host "Enable-BitLocker cmdlet failed due to parameter/driver environment. Falling back to manage-bde.exe." -ForegroundColor Yellow
-        } else {
-            Write-Warning "Enable-BitLocker failed: $msg"
+        $manageBdeOutput = & manage-bde.exe -on $MountPoint 2>&1
+        if ($manageBdeOutput) {
+            Ensure-BackupFolder -folder $BackupFolder | Out-Null
+            $stamp = (Get-Date).ToString("yyyyMMdd_HHmmss")
+            $mFile = Join-Path -Path $BackupFolder -ChildPath ("ManageBDE_Enable_$stamp.txt")
+            Save-TextToFile -text $manageBdeOutput -path $mFile | Out-Null
+            Log ("manage-bde enable output saved to {0}" -f $mFile)
         }
 
-        Write-Host "Attempting fallback using manage-bde.exe -on $MountPoint ..." -ForegroundColor Yellow
-        try {
-            $fallbackOutput = & manage-bde.exe -on $MountPoint 2>&1
-            Pretty-PrintManageBdeOutput -text $fallbackOutput
-            if ($fallbackOutput -match "Restart the computer" -or $fallbackOutput -match "hardware test" -or $fallbackOutput -match "Restart to run a hardware test" -or $fallbackOutput -match "ACTIONS REQUIRED") {
+        if ($manageBdeOutput -match "Restart the computer" -or $manageBdeOutput -match "hardware test" -or $manageBdeOutput -match "ACTIONS REQUIRED") {
+            $enabled = $true
+            if ($manageBdeOutput -match "Restart the computer" -or $manageBdeOutput -match "hardware test") {
+                $requiresRebootForHardwareTest = $true
+            }
+        } else {
+            $tmpVol = Get-BitLockerVolume -MountPoint $MountPoint -ErrorAction SilentlyContinue
+            if ($tmpVol -and ($tmpVol.ProtectionStatus -eq 1 -or ($tmpVol.EncryptionPercentage -ne $null -and $tmpVol.EncryptionPercentage -gt 0))) {
                 $enabled = $true
-                if ($fallbackOutput -match "Restart the computer" -or $fallbackOutput -match "hardware test") {
-                    $requiresRebootForHardwareTest = $true
-                }
+            } else {
+                $manageBdeFailed = $true
             }
+        }
+    } catch {
+        $manageBdeFailed = $true
+        Log ("manage-bde -on failed: {0}" -f $_.Exception.Message)
+    }
+
+    # Fallback to Enable-BitLocker if manage-bde did not enable
+    if (-not $enabled -and $manageBdeFailed) {
+        Write-Host "Attempting Enable-BitLocker cmdlet as fallback..." -ForegroundColor Cyan
+        try {
+            if ($forceSoftware) { Enable-BitLocker -MountPoint $MountPoint -EncryptionMethod XtsAes256 -UsedSpaceOnly -ErrorAction Stop } else { Enable-BitLocker -MountPoint $MountPoint -UsedSpaceOnly -ErrorAction Stop }
+            $enabled = $true
         } catch {
-            Write-Warning "manage-bde fallback failed: $($_.Exception.Message)"
-            try {
-                $fallbackOutput = & manage-bde.exe -on $MountPoint -usedspaceonly 2>&1
-                Pretty-PrintManageBdeOutput -text $fallbackOutput
-                if ($fallbackOutput -match "Restart the computer" -or $fallbackOutput -match "hardware test" -or $fallbackOutput -match "ACTIONS REQUIRED") {
-                    $enabled = $true
-                    if ($fallbackOutput -match "Restart the computer" -or $fallbackOutput -match "hardware test") {
-                        $requiresRebootForHardwareTest = $true
-                    }
-                }
-            } catch {
-                Write-Warning "manage-bde -usedspaceonly fallback failed: $($_.Exception.Message)"
-            }
+            Write-Warning ("Enable-BitLocker failed: {0}" -f $_.Exception.Message)
+            Log ("Enable-BitLocker failed after manage-bde fallback: {0}" -f $_.Exception.Message)
+            $enabled = $false
         }
     }
 
     if ($enabled) {
         if ($requiresRebootForHardwareTest) {
             Write-Host "`nA hardware test is required to begin encryption. The system must restart to run the test." -ForegroundColor Yellow
-            Write-Host "Recovery key information was saved to the backup folder. Confirm you have the file before rebooting." -ForegroundColor Yellow
 
-            $protectFiles = Get-ChildItem -Path $BackupFolder -Filter "ManageBDE_Protectors_*.txt" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending
-            if ($protectFiles -and $protectFiles[0]) {
-                Write-Host "Newest protectors file: $($protectFiles[0].FullName)" -ForegroundColor Green
-            } else {
-                Write-Host "No manage-bde protectors file found in ${BackupFolder}. Attempting to capture now." -ForegroundColor Yellow
-                $file, $text = Save-ManageBdeProtectorsText -MountPoint $MountPoint
-            }
-
-            # show next steps before asking to restart so user always sees guidance
             Write-Host "`nIMPORTANT NEXT STEPS (after this first run):" -ForegroundColor Cyan
             Write-Host "  1) Reboot now to run the hardware test and start encryption: shutdown /r /t 0" -ForegroundColor Yellow
             Write-Host "  2) After that reboot, LET BITLOCKER FINISH ENCRYPTION COMPLETELY (monitor with Get-BitLockerVolume or manage-bde -status)." -ForegroundColor Yellow
@@ -503,29 +478,10 @@ if ($blv.ProtectionStatus -eq 0 -or $blv.EncryptionMethod -eq $null -or $blv.Enc
         } else {
             Write-Host "Enable operation invoked. Waiting briefly for status..." -ForegroundColor Cyan
             $started = Wait-ForEncryptionStart -MountPoint $MountPoint -TimeoutMinutes $EncryptionStartTimeoutMinutes
-            if (-not $started) {
-                Write-Warning "Encryption/protection did not show active within timeout. Check status after reboot if needed."
-            } else {
-                # refresh status
+            if (-not $started) { Write-Warning "Encryption/protection did not show active within timeout. Check status after reboot if needed." } else {
                 $blv = Get-BitLockerVolume -MountPoint $MountPoint -ErrorAction SilentlyContinue
-
-                # If user explicitly requested hardware but device fell back to software, warn them
-                if (-not $forceSoftware) {
-                    $encNow = $blv.EncryptionMethod
-                    if (-not ($encNow -match "Hardware|HardwareEncryption")) {
-                        Write-Warning ""
-                        Write-Warning "Notice: although hardware encryption was requested, BitLocker is using software encryption on this drive."
-                        Write-Warning "Not all drives or firmware expose hardware encryption to Windows reliably; some vendors require special preparation (e.g. secure erase / PSID revert) to enable self-encrypting-drive features."
-                        Write-Warning "If you expected hardware encryption, check your drive vendor documentation (for example Samsung drives sometimes require a PSID revert) and re-run the script after preparing the drive."
-                        Write-Warning ""
-                        Log "Hardware encryption requested but software encryption in use."
-                    } else {
-                        Write-Host "Drive is using hardware encryption as requested." -ForegroundColor Green
-                    }
-                }
-
                 if ($blv -and ($blv.ProtectionStatus -ne 1 -or ($blv.EncryptionPercentage -ne $null -and $blv.EncryptionPercentage -lt 100))) {
-                    Write-Host "Protection enabled or encryption started." -ForegroundColor Green
+                    Write-Host "`nProtection enabled or encryption started." -ForegroundColor Green
                     Write-Host "`nIMPORTANT NEXT STEPS (after this first run):" -ForegroundColor Cyan
                     Write-Host "  1) Let BitLocker finish encryption completely (monitor with Get-BitLockerVolume -MountPoint $MountPoint)." -ForegroundColor Yellow
                     Write-Host "  2) When encryption shows as complete (EncryptionPercentage = 100 and ProtectionStatus = 1), REBOOT the system." -ForegroundColor Yellow
@@ -538,23 +494,20 @@ if ($blv.ProtectionStatus -eq 0 -or $blv.EncryptionMethod -eq $null -or $blv.Enc
             }
         }
     } else {
-        Write-Host "Enable step failed. Collecting diagnostics..." -ForegroundColor Red
+        Write-Host "Enable step failed (both manage-bde and Enable-BitLocker). Collecting diagnostics..." -ForegroundColor Red
         manage-bde -status $MountPoint
         manage-bde -protectors -get $MountPoint
         $events = Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='Microsoft-Windows-BitLocker-Driver'} -MaxEvents 50 -ErrorAction SilentlyContinue
-        if ($events) {
-            $events | Select-Object TimeCreated, Id, @{n='Message';e={$_.Message}} | Format-List
-        } else {
-            Write-Host "No BitLocker events found." -ForegroundColor Yellow
-        }
+        if ($events) { $events | Select-Object TimeCreated, Id, @{n='Message';e={$_.Message}} | Format-List } else { Write-Host "No BitLocker events found." -ForegroundColor Yellow }
         Write-Host "Aborting further changes." -ForegroundColor Red
         return
     }
 } else {
-    Write-Host "`nBitLocker already enabled or in progress. Skipping enable step." -ForegroundColor Cyan
+    Write-Host "BitLocker already enabled or in progress. Skipping enable step." -ForegroundColor Cyan
 }
 
-# Add TPM+PIN if required
+# TPM+PIN management
+Write-Host "`n== TPM+PIN management ==" -ForegroundColor Cyan
 $kp = (Get-BitLockerVolume -MountPoint $MountPoint -ErrorAction SilentlyContinue).KeyProtector
 $existingTpmPin = $null
 if ($kp) {
@@ -575,21 +528,34 @@ if ($RequireTpmPin) {
             return
         }
 
-        Write-Host "`nAdding TPM+PIN protector..." -ForegroundColor Cyan
+        Write-Host "Adding TPM+PIN protector..." -ForegroundColor Cyan
 
+        # PIN prompt with confirmation
         while ($true) {
-            $securePin = Read-Host -Prompt "Enter startup PIN (will not echo)" -AsSecureString
-            $ptr = $null
-            try {
-                $ptr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePin)
-                $plainPinCheck = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($ptr)
-            } finally {
-                if ($ptr) { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr); $ptr = $null }
+            $securePin1 = Read-Host -Prompt "Enter startup PIN (will not echo)" -AsSecureString
+            $ptr1 = $null; $plain1 = $null
+            try { $ptr1 = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePin1); $plain1 = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($ptr1) } finally { if ($ptr1) { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr1); $ptr1 = $null } }
+
+            $securePin2 = Read-Host -Prompt "Enter startup PIN again (will not echo)" -AsSecureString
+            $ptr2 = $null; $plain2 = $null
+            try { $ptr2 = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePin2); $plain2 = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($ptr2) } finally { if ($ptr2) { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr2); $ptr2 = $null } }
+
+            if ($plain1 -ne $plain2) {
+                Write-Host "PIN entries do not match. Please try again." -ForegroundColor Yellow
+                $securePin1 = $null; $securePin2 = $null; $plain1 = $null; $plain2 = $null
+                continue
             }
-            if ($plainPinCheck.Length -ge $MinPinLength) { break }
-            Write-Host "PIN too short. Minimum length is $MinPinLength." -ForegroundColor Yellow
+            if ($plain1.Length -lt $MinPinLength) {
+                Write-Host "PIN too short. Minimum length is $MinPinLength." -ForegroundColor Yellow
+                $securePin1 = $null; $securePin2 = $null; $plain1 = $null; $plain2 = $null
+                continue
+            }
+            $plainPin = $plain1
+            $securePin1 = $null; $securePin2 = $null; $plain1 = $null; $plain2 = $null
+            break
         }
 
+        # Locate Win32_EncryptableVolume and attempt TPM+PIN via CIM, fallback to cmdlet
         Write-Host "`nLocating Win32_EncryptableVolume..." -ForegroundColor Cyan
         $cimNs = 'Root\CIMV2\Security\MicrosoftVolumeEncryption'
         try { $vols = Get-CimInstance -Namespace $cimNs -ClassName Win32_EncryptableVolume -ErrorAction Stop } catch { $vols = $null }
@@ -600,28 +566,18 @@ if ($RequireTpmPin) {
             if (-not $vol) { $vol = $vols | Select-Object -First 1 }
         }
 
-        $ptr = $null
-        $plainPin = $null
-        try {
-            $ptr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePin)
-            $plainPin = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($ptr)
-        } finally {
-            if ($ptr) { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr); $ptr = $null }
-        }
-
         $addedTpmPin = $false
         if ($vol) {
             [byte[]]$pcrArray = [byte[]]($PCRsToEnable | ForEach-Object {[byte]$_})
             try {
-                $out = Invoke-CimMethod -InputObject $vol -MethodName ProtectKeyWithTPMAndPIN `
-                    -Arguments @{ FriendlyName = "TPM+PIN"; PlatformValidationProfile = $pcrArray; PIN = $plainPin } -ErrorAction Stop
+                $out = Invoke-CimMethod -InputObject $vol -MethodName ProtectKeyWithTPMAndPIN -Arguments @{ FriendlyName = "TPM+PIN"; PlatformValidationProfile = $pcrArray; PIN = $plainPin } -ErrorAction Stop
                 if ($null -ne $out -and $out.ReturnValue -eq 0) {
                     Write-Host "ProtectKeyWithTPMAndPIN succeeded. New protector ID: $($out.VolumeKeyProtectorID)" -ForegroundColor Green
                     $addedTpmPin = $true
                 }
             } catch {
-                Write-Warning "ProtectKeyWithTPMAndPIN failed or not supported: $($_.Exception.Message)"
-                Log "ProtectKeyWithTPMAndPIN failed: $($_.Exception.Message)"
+                Write-Warning ("ProtectKeyWithTPMAndPIN failed or not supported: {0}" -f $_.Exception.Message)
+                Log ("ProtectKeyWithTPMAndPIN failed: {0}" -f $_.Exception.Message)
             }
         }
 
@@ -632,17 +588,16 @@ if ($RequireTpmPin) {
                 Write-Host "Added TPM+PIN via Add-BitLockerKeyProtector (fallback)." -ForegroundColor Green
                 $addedTpmPin = $true
             } catch {
-                Write-Warning "Failed to add TPM+PIN via cmdlet: $($_.Exception.Message)"
-                Log "Add-BitLockerKeyProtector (TPM+PIN) failed: $($_.Exception.Message)"
+                Write-Warning ("Failed to add TPM+PIN via cmdlet: {0}" -f $_.Exception.Message)
+                Log ("Add-BitLockerKeyProtector (TPM+PIN) failed: {0}" -f $_.Exception.Message)
             }
         }
 
         $plainPin = $null
-        $securePin = $null
 
         if ($addedTpmPin) {
             $file, $text = Save-ManageBdeProtectorsText -MountPoint $MountPoint
-            if ($file) { Write-Host "Protectors saved to $file" -ForegroundColor Green }
+            if ($file) { Write-Host "Protectors saved to backup folder." -ForegroundColor Green }
 
             $kp = (Get-BitLockerVolume -MountPoint $MountPoint -ErrorAction SilentlyContinue).KeyProtector
             $tpmOnly = $kp | Where-Object { $_.KeyProtectorType -eq 'Tpm' }
@@ -650,7 +605,7 @@ if ($RequireTpmPin) {
                 Write-Host "`nFound TPM-only protector(s):" -ForegroundColor Cyan
                 $tpmOnly | Format-Table KeyProtectorId, KeyProtectorType -AutoSize
                 Write-Host "Removing TPM-only protectors will force the system to require TPM+PIN at pre-boot and is irreversible without the recovery key." -ForegroundColor Yellow
-                Write-Host "The recovery protector has been saved to the backup folder. Confirm you have it before deleting TPM-only protectors." -ForegroundColor Yellow
+                Write-Host "Ensure you have the recovery key saved before deleting TPM-only protectors." -ForegroundColor Yellow
 
                 $confirm = Read-Host "Type DELETE to permanently remove TPM-only protectors (or press Enter to skip)"
                 if ($confirm -eq 'DELETE') {
@@ -659,9 +614,7 @@ if ($RequireTpmPin) {
                             Write-Host "Removing protector ID $($prot.KeyProtectorId) ..." -ForegroundColor Cyan
                             manage-bde -protectors -delete $MountPoint -id "$($prot.KeyProtectorId)" | Out-Null
                             Write-Host "Removed $($prot.KeyProtectorId)" -ForegroundColor Green
-                        } catch {
-                            Write-Warning "Failed to remove protector $($prot.KeyProtectorId): $($_.Exception.Message)"
-                        }
+                        } catch { Write-Warning ("Failed to remove protector {0}: {1}" -f $prot.KeyProtectorId, $_.Exception.Message) }
                     }
                 } else {
                     Write-Host "Skipping TPM-only protector deletion." -ForegroundColor Cyan
@@ -674,15 +627,13 @@ if ($RequireTpmPin) {
         }
     }
 } else {
-    Write-Host "`nTPM+PIN enforcement disabled by configuration. Skipping automatic creation." -ForegroundColor Cyan
+    Write-Host "TPM+PIN enforcement disabled by configuration. Skipping automatic creation." -ForegroundColor Cyan
 }
 
-# Final verification
+# Final verification output
 Write-Host "`n== Verification ==" -ForegroundColor Cyan
-manage-bde -protectors -get $MountPoint
+manage-bde -protectors -get $MountPoint | Out-Host
 Get-BitLockerVolume -MountPoint $MountPoint | Format-List *
 
 Write-Host "`n== Done. ==" -ForegroundColor Green
-
-# Final strong warning
 Write-Host "`nLAST WARNING: BACKUP YOUR RECOVERY KEY NOW. If something goes wrong and you do NOT have this key, you will be locked out of your machine!" -ForegroundColor Red
